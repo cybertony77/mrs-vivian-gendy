@@ -46,6 +46,7 @@ export default function ZoomRecordingSelect({ selectedValue, onSelect }) {
   const showPagination = hasPrev || hasNext;
   const selectedMeeting = meetings.find(
     (meeting) =>
+      selectedValue === meeting.zoom_proxy_id ||
       selectedValue === meeting.zoom_direct_video_url ||
       selectedValue === meeting.uuid
   );
@@ -166,13 +167,18 @@ export default function ZoomRecordingSelect({ selectedValue, onSelect }) {
                 </div>
               ) : (
                 meetings.map((meeting) => {
-                  const directUrl = meeting.zoom_direct_video_url || '';
-                  const isSelected = selectedValue === directUrl || selectedValue === meeting.uuid;
+                  const proxyId =
+                    meeting.zoom_proxy_id ||
+                    meeting.zoom_direct_video_url ||
+                    meeting.uuid ||
+                    '';
+                  const isSelected =
+                    selectedValue === proxyId || selectedValue === meeting.uuid;
                   return (
                     <div
                       key={meeting.uuid || String(meeting.id)}
                       onClick={() => {
-                        onSelect(directUrl || meeting.uuid || '');
+                        onSelect(proxyId);
                         setIsOpen(false);
                       }}
                       style={{

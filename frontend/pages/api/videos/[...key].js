@@ -4,8 +4,14 @@ import fs from 'fs';
 import http from 'http';
 import https from 'https';
 import path from 'path';
+import { MongoClient } from 'mongodb';
 import { authMiddleware } from '../../../lib/authMiddleware';
-import { getZoomAccessToken, getZoomMeetingMp4DownloadUrl } from '../../../lib/zoomServer';
+import { getZoomAccessToken, resolveZoomMp4DownloadUrl } from '../../../lib/zoomServer';
+import { extractZoomMeetingId } from '../../../lib/zoomUtils';
+import {
+  getMongoFromEnv,
+  MARKETING_DOC_ID,
+} from '../../../lib/marketingPageMongo';
 import { Readable } from 'stream';
 
 // Disable Next.js body parsing — we stream raw bytes
@@ -48,10 +54,6 @@ const accountId = envConfig.CLOUDFLARE_ACCOUNT_ID || process.env.CLOUDFLARE_ACCO
 const accessKeyId = envConfig.R2_ACCESS_KEY_ID || process.env.R2_ACCESS_KEY_ID;
 const secretAccessKey = envConfig.R2_SECRET_ACCESS_KEY || process.env.R2_SECRET_ACCESS_KEY;
 const bucketName = envConfig.R2_BUCKET_NAME || process.env.R2_BUCKET_NAME;
-const zoomRecordingBaseUrl =
-  envConfig.ZOOM_RECORDING_BASE_URL ||
-  process.env.ZOOM_RECORDING_BASE_URL ||
-  'https://us06web.zoom.us/rec/download/';
 
 const httpsAgent = new https.Agent({
   keepAlive: true,
@@ -95,19 +97,65 @@ function getContentType(key) {
   return 'application/octet-stream';
 }
 
+function idsMatch(a, b) {
+  const left = String(a || '').trim();
+  const right = String(b || '').trim();
+  if (!left || !right) return false;
+  if (left === right) return true;
+  const leftNorm = extractZoomMeetingId(left) || left;
+  const rightNorm = extractZoomMeetingId(right) || right;
+  return leftNorm === rightNorm;
+}
+
+/** Allow unauthenticated playback only for the published welcome free-session video. */
+async function isPublicMarketingSessionVideo(routeParts, { isZoomByPrefix, isZoomByMeetingIdRoute }) {
+  const systemEnabled =
+    (loadEnvConfig().SYSTEM_MARKETING_PAGE === 'true') ||
+    process.env.SYSTEM_MARKETING_PAGE === 'true';
+  if (!systemEnabled) return false;
+
+  const { MONGO_URI, DB_NAME } = getMongoFromEnv();
+  let client;
+  try {
+    client = await MongoClient.connect(MONGO_URI);
+    const db = client.db(DB_NAME);
+    const doc = await db.collection('marketing_page').findOne(
+      { _id: MARKETING_DOC_ID },
+      { projection: { page_state: 1, session_video_type: 1, session_video_id: 1 } }
+    );
+    if (!doc || doc.page_state === false) return false;
+
+    const type = String(doc.session_video_type || '').toLowerCase();
+    const savedId = String(doc.session_video_id || '').trim();
+    if (!type || !savedId) return false;
+
+    if (type === 'zoom' && (isZoomByPrefix || isZoomByMeetingIdRoute)) {
+      const zoomIdentifier = decodeURIComponent(
+        String(isZoomByPrefix ? routeParts.slice(1).join('/') : routeParts[0] || '').trim()
+      );
+      return idsMatch(zoomIdentifier, savedId);
+    }
+
+    if (type === 'r2' && !isZoomByPrefix && !isZoomByMeetingIdRoute) {
+      const objectKey = routeParts.join('/');
+      return idsMatch(objectKey, savedId) || idsMatch(decodeURIComponent(objectKey), savedId);
+    }
+
+    return false;
+  } catch (e) {
+    console.error('public marketing session video check failed:', e);
+    return false;
+  } finally {
+    if (client) await client.close();
+  }
+}
+
 // ─── Handler ──────────────────────────────────────────────────────────────────
 
 export default async function handler(req, res) {
   // Only GET and HEAD
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     return res.status(405).json({ error: 'Method not allowed' });
-  }
-
-  // ── Auth check ────────────────────────────────────────────────────────────
-  try {
-    await authMiddleware(req);
-  } catch {
-    return res.status(401).json({ error: 'Unauthorized' });
   }
 
   // ── Build key from catch-all segments ────────────────────────────────────
@@ -120,9 +168,29 @@ export default async function handler(req, res) {
   const isZoomByPrefix = routeParts[0] === 'zoom';
   const isZoomByMeetingIdRoute = routeParts.length === 1 && /^[0-9]+$/.test(String(routeParts[0]));
 
+  // ── Auth check (allow public welcome free-session Zoom/R2 video) ───────────
+  let isAuthenticated = false;
+  try {
+    await authMiddleware(req);
+    isAuthenticated = true;
+  } catch {
+    isAuthenticated = false;
+  }
+
+  if (!isAuthenticated) {
+    const allowedPublic = await isPublicMarketingSessionVideo(routeParts, {
+      isZoomByPrefix,
+      isZoomByMeetingIdRoute,
+    });
+    if (!allowedPublic) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+  }
+
   // Zoom routes:
   // - /api/videos/{meetingId}
-  // - /api/videos/zoom/{meetingId}
+  // - /api/videos/zoom/{uuid|meetingId|downloadKey}
+  // Each request resolves a FRESH download_url from Zoom (UUID architecture preserved).
   if (isZoomByPrefix || isZoomByMeetingIdRoute) {
     const zoomIdentifier = decodeURIComponent(
       String(isZoomByPrefix ? routeParts.slice(1).join('/') : routeParts[0] || '').trim()
@@ -132,63 +200,32 @@ export default async function handler(req, res) {
     }
 
     try {
-      const isNumericMeetingId = /^[0-9]+$/.test(zoomIdentifier);
-      let downloadUrl = '';
+      const stableId = extractZoomMeetingId(zoomIdentifier) || zoomIdentifier;
 
-      if (isNumericMeetingId) {
-        let recordingInfo;
-        try {
-          recordingInfo = await getZoomMeetingMp4DownloadUrl(zoomIdentifier);
-        } catch (err) {
-          if (err?.statusCode === 401) {
-            recordingInfo = await getZoomMeetingMp4DownloadUrl(zoomIdentifier, true);
-          } else {
-            throw err;
-          }
-        }
-        downloadUrl = recordingInfo.downloadUrl;
-      } else if (/^https?:\/\//i.test(zoomIdentifier)) {
-        const parsed = new URL(zoomIdentifier);
-        const match = parsed.pathname.match(/\/rec\/download\/([^/]+)/i);
-        const key = match?.[1] ? decodeURIComponent(match[1]) : '';
-        downloadUrl = key
-          ? `${zoomRecordingBaseUrl.replace(/\/+$/, '')}/${encodeURIComponent(key)}`
-          : zoomIdentifier;
-      } else {
-        downloadUrl = `${zoomRecordingBaseUrl.replace(/\/+$/, '')}/${encodeURIComponent(zoomIdentifier)}`;
-      }
-
-      let token;
-      try {
-        token = await getZoomAccessToken();
-      } catch {
-        token = await getZoomAccessToken(true);
-      }
-
-      const upstreamHeaders = {
-        Authorization: `Bearer ${token}`,
-      };
-      if (req.headers.range) {
-        upstreamHeaders.Range = req.headers.range;
-      }
-
-      let zoomVideoResponse = await fetch(downloadUrl, {
-        method: req.method,
-        headers: upstreamHeaders,
-      });
-
-      if (zoomVideoResponse.status === 401) {
-        const freshToken = await getZoomAccessToken(true);
-        const retryHeaders = {
-          Authorization: `Bearer ${freshToken}`,
+      const fetchUpstream = async (forceRefresh) => {
+        const downloadUrl = await resolveZoomMp4DownloadUrl(stableId, forceRefresh);
+        const token = await getZoomAccessToken(forceRefresh);
+        const upstreamHeaders = {
+          Authorization: `Bearer ${token}`,
         };
         if (req.headers.range) {
-          retryHeaders.Range = req.headers.range;
+          upstreamHeaders.Range = req.headers.range;
         }
-        zoomVideoResponse = await fetch(downloadUrl, {
+        const response = await fetch(downloadUrl, {
           method: req.method,
-          headers: retryHeaders,
+          headers: upstreamHeaders,
         });
+        return { response, downloadUrl };
+      };
+
+      let { response: zoomVideoResponse } = await fetchUpstream(false);
+
+      // Token or download_url expired — refresh OAuth + re-resolve fresh download_url
+      if (
+        zoomVideoResponse.status === 401 ||
+        zoomVideoResponse.status === 403
+      ) {
+        ({ response: zoomVideoResponse } = await fetchUpstream(true));
       }
 
       if (!zoomVideoResponse.ok) {
@@ -214,9 +251,10 @@ export default async function handler(req, res) {
       });
 
       res.setHeader('Content-Type', 'video/mp4');
-      res.setHeader('Cache-Control', 'private, no-store, no-cache, must-revalidate');
+      res.setHeader('Cache-Control', 'private, no-store, no-cache, must-revalidate, max-age=0');
       res.setHeader('Pragma', 'no-cache');
       res.setHeader('Expires', '0');
+      res.setHeader('Vary', 'Cookie, Range');
       res.statusCode = zoomVideoResponse.status;
 
       if (req.method === 'HEAD') {
@@ -257,7 +295,10 @@ export default async function handler(req, res) {
         return res.status(401).json({ error: 'Zoom token expired' });
       }
       if (statusCode === 400) {
-        return res.status(400).json({ error: error.message || 'Invalid meeting ID' });
+        return res.status(400).json({ error: error.message || 'Invalid recording identifier' });
+      }
+      if (statusCode === 409) {
+        return res.status(409).json({ error: error.message || 'Ambiguous meeting ID' });
       }
       return res.status(502).json({
         error: 'Zoom API failure',
